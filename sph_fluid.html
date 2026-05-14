@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SPH Two-Fluid Simulation - Water & Wax</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0f0f1a;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #container {
+    position: relative;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 0 40px rgba(0,0,0,0.5);
+  }
+  canvas {
+    display: block;
+    cursor: crosshair;
+  }
+  #ui {
+    position: absolute;
+    top: 12px;
+    left: 16px;
+    color: #888;
+    font-size: 13px;
+    pointer-events: none;
+    line-height: 1.6;
+  }
+  #ui span { color: #ccc; }
+  #hint {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #555;
+    font-size: 13px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    FPS: <span id="fps">--</span><br>
+    Particles: <span id="count">--</span><br>
+    <span style="color:#4da6ff">Water</span> / <span style="color:#f0b028">Wax</span>
+  </div>
+  <div id="hint">Hold &amp; drag mouse to stir &nbsp;|&nbsp; Press R to reset</div>
+</div>
+
+<script>
+// ============================================================
+//  CONFIGURATION
+// ============================================================
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const W = 900;
+const H = 650;
+canvas.width = W;
+canvas.height = H;
+
+const GRAVITY = 980;
+const GAMMA = 7;
+const H_K = 24;              // smoothing length (pixels)
+const SUPPORT = 2 * H_K;
+const H2 = H_K * H_K;
+const DT = 0.0025;           // fixed physics timestep
+const MAX_SUBSTEPS = 10;
+const MASS = 1.0;
+const EPS_H2 = 0.01 * H2;
+
+const T_WATER = 0;
+const T_WAX = 1;
+
+const WATER_COLOR = '#3b8bf5';
+const WATER_GLOW = '#1a5bb5';
+const WAX_COLOR = '#f0b028';
+const WAX_GLOW = '#b87810';
+
+const BOWL_CX = W / 2;
+const BOWL_CY = 435;
+const BOWL_R = 215;
+
+const STIR_RADIUS = 80;
+const STIR_STRENGTH = 0.45;
+
+// Calibrated after initialization
+let RHO0_WATER, RHO0_WAX;
+let B_WATER = 8000, B_WAX = 2800;
+let ALPHA_WATER = 0.015, ALPHA_WAX = 0.55;
+
+// Cubic spline normalization: σ = 10/(7πh²) in 2D
+const SIGMA = 10 / (7 * Math.PI * H2);
+const SIGMA_OVER_H = SIGMA / H_K;
+
+// ============================================================
+//  CUBIC SPLINE KERNEL (2D)
+//  W(r) = σ · { (2−q)³−4(1−q)³  0≤q<1; (2−q)³  1≤q<2; 0  q≥2 }
+//  where q = r/h, σ = 10/(7πh²)
+// ============================================================
+
+function kernelW(r) {
+  const q = r / H_K;
+  if (q >= 2) return 0;
+  const t = 2 - q;
+  const t3 = t * t * t;
+  if (q < 1) {
+    const s = 1 - q;
+    return SIGMA * (t3 - 4 * s * s * s);
+  }
+  return SIGMA * t3;
+}
+
+// ∂W/∂r (scalar part)
+function kernelDWdr(r) {
+  if (r < 1e-8) return 0;
+  const q = r / H_K;
+  if (q >= 2) return 0;
+  if (q < 1) {
+    const t = 2 - q, s = 1 - q;
+    return SIGMA_OVER_H * (-3 * t * t + 12 * s * s);
+  }
+  const t = 2 - q;
+  return SIGMA_OVER_H * (-3 * t * t);
+}
+
+// ============================================================
+//  SPATIAL GRID
+// ============================================================
+const CELL = SUPPORT;
+const COLS = Math.ceil(W / CELL) + 1;
+const ROWS = Math.ceil(H / CELL) + 1;
+const GRID_SIZE = COLS * ROWS;
+
+// Pre-allocated combined array (particles + boundaries), rebuilt on reset
+let allParticles = [];
+
+// ============================================================
+//  PARTICLES & BOUNDARIES
+// ============================================================
+let particles = [];
+let boundaries = [];
+
+function initBoundaries() {
+  boundaries = [];
+  const layers = 3;
+  const layerGap = H_K / 3;
+  const arcLen = Math.PI * BOWL_R;
+  const spacing = H_K / 2.8;
+  const nPerLayer = Math.floor(arcLen / spacing);
+
+  for (let L = 0; L < layers; L++) {
+    const r = BOWL_R - L * layerGap;
+    for (let i = 0; i <= nPerLayer; i++) {
+      const ang = (Math.PI * i) / nPerLayer; // 0 to π
+      const x = BOWL_CX + r * Math.cos(ang);
+      const y = BOWL_CY + r * Math.sin(ang);
+      boundaries.push({
+        x, y,
+        vx: 0, vy: 0,
+        rho: 0, p: 0,
+        mass: MASS,
+        isBoundary: true
+      });
+    }
+  }
+}
+
+function isInsideBowl(x, y, margin) {
+  const dx = x - BOWL_CX;
+  const dy = y - BOWL_CY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  return dist < BOWL_R - margin && y > BOWL_CY + margin * 0.3;
+}
+
+function initParticles() {
+  particles = [];
+  const spacing = 10.5;
+  const margin = H_K * 0.8;
+  const rowH = spacing * 0.866;
+
+  let row = 0;
+  for (let py = BOWL_CY + margin * 0.3; py < BOWL_CY + BOWL_R - margin; py += rowH) {
+    const offset = (row % 2) * spacing * 0.5;
+    for (let px = BOWL_CX - BOWL_R + margin; px < BOWL_CX + BOWL_R - margin; px += spacing) {
+      const x = px + offset;
+      const y = py + (Math.random() - 0.5) * spacing * 0.3;
+      if (isInsideBowl(x, y, margin)) {
+        // Bottom 50% → water, top 50% → wax
+        const normY = (y - BOWL_CY) / BOWL_R; // 0 at center, 1 at bottom
+        const type = normY > 0.5 ? T_WATER : T_WAX;
+        particles.push({
+          x, y,
+          vx: (Math.random() - 0.5) * 2,
+          vy: (Math.random() - 0.5) * 2,
+          rho: 0, p: 0,
+          type,
+          mass: MASS,
+          isBoundary: false
+        });
+      }
+    }
+    row++;
+  }
+}
+
+function calibrateRestDensity() {
+  // Compute densities once to calibrate rest density
+  buildGrid(allParticles);
+
+  for (const p of particles) {
+    p.rho = computeDensity(p, allParticles);
+  }
+
+  let sumW = 0, cntW = 0, sumX = 0, cntX = 0;
+  for (const p of particles) {
+    if (p.type === T_WATER) { sumW += p.rho; cntW++; }
+    else { sumX += p.rho; cntX++; }
+  }
+  RHO0_WATER = sumW / cntW;
+  RHO0_WAX = RHO0_WATER * 0.78; // wax is ~78% as dense as water
+
+  // Calibrate stiffness for ~4% density variation (WCSPH target).
+  // From hydrostatic: P ≈ ρ₀·g·H.  From Tait: P ≈ B·γ·Δρ/ρ₀.
+  // So: B = ρ₀·g·H / (γ · allowed_variation)
+  const allowedVar = 0.04;
+  const H_col = BOWL_R * 0.85;
+  B_WATER = RHO0_WATER * GRAVITY * H_col / (allowedVar * GAMMA);
+  B_WAX = B_WATER * 0.35;
+}
+
+// ============================================================
+//  GRID BUILD
+// ============================================================
+let gridCells = new Array(GRID_SIZE);
+let gridCounts = new Int32Array(GRID_SIZE);
+
+function buildGrid(allP) {
+  gridCells.fill(null);
+  gridCounts.fill(0);
+
+  // Count per cell
+  for (let i = 0; i < allP.length; i++) {
+    const p = allP[i];
+    const cx = Math.floor(p.x / CELL);
+    const cy = Math.floor(p.y / CELL);
+    if (cx >= 0 && cx < COLS && cy >= 0 && cy < ROWS) {
+      p._cx = cx;
+      p._cy = cy;
+      gridCounts[cy * COLS + cx]++;
+    } else {
+      p._cx = -1;
+      p._cy = -1;
+    }
+  }
+
+  // Allocate cell arrays
+  for (let i = 0; i < GRID_SIZE; i++) {
+    if (gridCounts[i] > 0) {
+      gridCells[i] = new Array(gridCounts[i]);
+      gridCounts[i] = 0; // reset for fill
+    }
+  }
+
+  // Fill cells
+  for (let i = 0; i < allP.length; i++) {
+    const p = allP[i];
+    if (p._cx >= 0) {
+      const idx = p._cy * COLS + p._cx;
+      gridCells[idx][gridCounts[idx]++] = p;
+    }
+  }
+}
+
+// ============================================================
+//  DENSITY COMPUTATION
+// ============================================================
+function computeDensity(pi, allP) {
+  let rho = 0;
+  const cx = pi._cx, cy = pi._cy;
+
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const nx = cx + dx, ny = cy + dy;
+      if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+      const cell = gridCells[ny * COLS + nx];
+      if (!cell) continue;
+      const count = gridCounts[ny * COLS + nx];
+      for (let k = 0; k < count; k++) {
+        const pj = cell[k];
+        if (pj === pi) continue;
+        const dxij = pi.x - pj.x;
+        const dyij = pi.y - pj.y;
+        const r2 = dxij * dxij + dyij * dyij;
+        if (r2 >= H2 * 4) continue; // r >= 2h
+        const r = Math.sqrt(r2);
+        rho += pj.mass * kernelW(r);
+      }
+    }
+  }
+  // Self contribution: W(0) = σ·(8−4) = 4σ
+  rho += pi.mass * 4 * SIGMA;
+  return Math.max(rho, 1e-10);
+}
+
+// ============================================================
+//  WCSPH PRESSURE  (Tait equation)
+//  P = B * ((ρ/ρ₀)^γ − 1)
+// ============================================================
+function taitPressure(rho, rho0, B) {
+  const ratio = rho / rho0;
+  if (ratio <= 0) return 0;
+  return B * (Math.pow(ratio, GAMMA) - 1);
+}
+
+// ============================================================
+//  SIMULATION STEP
+// ============================================================
+function simulate(dt) {
+  // 1. Build grid from pre-allocated combined array
+  buildGrid(allParticles);
+
+  // 2. Compute densities
+  for (const p of particles) {
+    p.rho = computeDensity(p, allParticles);
+  }
+  for (const b of boundaries) {
+    b.rho = computeDensity(b, allParticles);
+  }
+
+  // 3. Compute pressures
+  for (const p of particles) {
+    const rho0 = p.type === T_WATER ? RHO0_WATER : RHO0_WAX;
+    const B = p.type === T_WATER ? B_WATER : B_WAX;
+    p.p = taitPressure(p.rho, rho0, B);
+    if (p.p < 0) p.p = 0; // clamp negative pressure
+  }
+  for (const b of boundaries) {
+    b.p = taitPressure(b.rho, RHO0_WATER, B_WATER);
+    if (b.p < 0) b.p = 0;
+  }
+
+  // Store old velocity for viscosity
+  for (const p of particles) {
+    p._vx0 = p.vx;
+    p._vy0 = p.vy;
+  }
+
+  // 4. Compute forces: pressure gradient + artificial viscosity
+  for (const pi of particles) {
+    let fx = 0, fy = 0;
+    const cx = pi._cx, cy = pi._cy;
+    const rho0_i = pi.type === T_WATER ? RHO0_WATER : RHO0_WAX;
+    const Bi = pi.type === T_WATER ? B_WATER : B_WAX;
+    const alphai = pi.type === T_WATER ? ALPHA_WATER : ALPHA_WAX;
+    const ci = Math.sqrt(Bi * GAMMA / rho0_i);
+    const presTermI = pi.p / (pi.rho * pi.rho);
+
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+        const cell = gridCells[ny * COLS + nx];
+        if (!cell) continue;
+        const count = gridCounts[ny * COLS + nx];
+
+        for (let k = 0; k < count; k++) {
+          const pj = cell[k];
+          if (pj === pi) continue;
+
+          const dxij = pi.x - pj.x;
+          const dyij = pi.y - pj.y;
+          const r2 = dxij * dxij + dyij * dyij;
+          if (r2 >= 4 * H2 || r2 < 1e-12) continue;
+          const r = Math.sqrt(r2);
+
+          const dwdr = kernelDWdr(r);
+          if (dwdr === 0) continue;
+
+          // Pressure gradient force (symmetric, conservative)
+          const rho0_j = pj.isBoundary ? RHO0_WATER : (pj.type === T_WATER ? RHO0_WATER : RHO0_WAX);
+          const Bj = pj.isBoundary ? B_WATER : (pj.type === T_WATER ? B_WATER : B_WAX);
+          const presTermJ = pj.p / (pj.rho * pj.rho);
+          const pForce = (presTermI + presTermJ) * dwdr / r;
+
+          // Artificial viscosity (Monaghan 1992)
+          const dvx = pi._vx0 - (pj.isBoundary ? 0 : pj._vx0);
+          const dvy = pi._vy0 - (pj.isBoundary ? 0 : pj._vy0);
+          const vDotR = dvx * dxij + dvy * dyij;
+
+          let viscTerm = 0;
+          if (vDotR < 0) {
+            const rhoBar = (pi.rho + pj.rho) * 0.5;
+            const alphaBar = pj.isBoundary ? alphai : (alphai + (pj.type === T_WATER ? ALPHA_WATER : ALPHA_WAX)) * 0.5;
+            const cBar = pj.isBoundary ? ci : (ci + Math.sqrt(Bj * GAMMA / rho0_j)) * 0.5;
+            const mu = H_K * vDotR / (r2 + EPS_H2);
+            const pi_ij = -alphaBar * cBar * mu / rhoBar;
+            viscTerm = pi_ij * dwdr / r;
+          }
+
+          const totalForce = -(pForce + viscTerm);
+          fx += pj.mass * totalForce * dxij;
+          fy += pj.mass * totalForce * dyij;
+        }
+      }
+    }
+
+    // Gravity
+    fy += GRAVITY;
+
+    // Integrate (symplectic Euler)
+    pi.vx += fx * dt;
+    pi.vy += fy * dt;
+  }
+
+  // 5. Position update & boundary enforcement
+  for (const p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+
+    const dx = p.x - BOWL_CX;
+    const dy = p.y - BOWL_CY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    // Constrain particles inside the semi-circle bowl.
+    // The bowl walls exist only at y >= BOWL_CY (below the opening).
+    // Particles splashing above the opening are free — gravity returns them.
+    if (p.y >= BOWL_CY - 3 && dist > BOWL_R - 2) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      p.x = BOWL_CX + nx * (BOWL_R - 3);
+      p.y = BOWL_CY + ny * (BOWL_R - 3);
+      const vn = p.vx * nx + p.vy * ny;
+      if (vn > 0) {
+        p.vx -= 1.2 * vn * nx;
+        p.vy -= 1.2 * vn * ny;
+      }
+    }
+
+    // Floor constraint (below canvas)
+    if (p.y > H - 5) {
+      p.y = H - 5;
+      p.vy *= -0.4;
+    }
+  }
+}
+
+// ============================================================
+//  MOUSE INTERACTION
+// ============================================================
+let mouseX = -1000, mouseY = -1000;
+let prevMouseX = -1000, prevMouseY = -1000;
+let framePrevMX = -1000, framePrevMY = -1000;
+let mouseDown = false;
+
+function getMousePos(e) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  mouseDown = true;
+  const pos = getMousePos(e);
+  mouseX = pos.x; mouseY = pos.y;
+  prevMouseX = mouseX; prevMouseY = mouseY;
+  framePrevMX = mouseX; framePrevMY = mouseY;
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  const pos = getMousePos(e);
+  prevMouseX = mouseX;
+  prevMouseY = mouseY;
+  mouseX = pos.x;
+  mouseY = pos.y;
+  if (!mouseDown) {
+    prevMouseX = mouseX; prevMouseY = mouseY;
+    framePrevMX = mouseX; framePrevMY = mouseY;
+  }
+});
+
+canvas.addEventListener('mouseup', () => { mouseDown = false; });
+canvas.addEventListener('mouseleave', () => { mouseDown = false; });
+
+// Touch support
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  mouseDown = true;
+  const pos = getMousePos(e.touches[0]);
+  mouseX = pos.x; mouseY = pos.y;
+  prevMouseX = mouseX; prevMouseY = mouseY;
+  framePrevMX = mouseX; framePrevMY = mouseY;
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const pos = getMousePos(e.touches[0]);
+  prevMouseX = mouseX; prevMouseY = mouseY;
+  mouseX = pos.x; mouseY = pos.y;
+}, { passive: false });
+
+canvas.addEventListener('touchend', () => { mouseDown = false; });
+
+function applyMouseForce() {
+  if (!mouseDown) {
+    framePrevMX = mouseX; framePrevMY = mouseY;
+    return;
+  }
+
+  const mvx = mouseX - framePrevMX;
+  const mvy = mouseY - framePrevMY;
+  const mouseSpeed = Math.sqrt(mvx * mvx + mvy * mvy);
+
+  framePrevMX = mouseX;
+  framePrevMY = mouseY;
+
+  if (mouseSpeed < 0.5) return;
+
+  for (const p of particles) {
+    const ddx = p.x - mouseX;
+    const ddy = p.y - mouseY;
+    const dist = Math.sqrt(ddx * ddx + ddy * ddy);
+    if (dist < STIR_RADIUS) {
+      const falloff = 1 - dist / STIR_RADIUS;
+      const strength = falloff * falloff * STIR_STRENGTH;
+      p.vx += mvx * strength;
+      p.vy += mvy * strength;
+      // Radial push for mixing
+      if (dist > 2) {
+        const push = strength * 120;
+        p.vx += (ddx / dist) * push;
+        p.vy += (ddy / dist) * push;
+      }
+    }
+  }
+}
+
+// ============================================================
+//  RENDERING
+// ============================================================
+function drawBowl() {
+  ctx.save();
+  // Bowl shadow
+  ctx.shadowColor = 'rgba(0,0,0,0.4)';
+  ctx.shadowBlur = 20;
+  ctx.shadowOffsetY = 4;
+
+  // Bowl body
+  ctx.beginPath();
+  ctx.arc(BOWL_CX, BOWL_CY, BOWL_R, 0, Math.PI);
+  ctx.closePath();
+
+  const grad = ctx.createLinearGradient(BOWL_CX, BOWL_CY - BOWL_R, BOWL_CX, BOWL_CY + BOWL_R);
+  grad.addColorStop(0, '#3a3a4a');
+  grad.addColorStop(0.5, '#2a2a38');
+  grad.addColorStop(1, '#1a1a28');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+
+  // Bowl rim
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  // Rim highlight
+  ctx.beginPath();
+  ctx.arc(BOWL_CX, BOWL_CY, BOWL_R, 0, Math.PI);
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Inner rim line
+  ctx.beginPath();
+  ctx.arc(BOWL_CX, BOWL_CY, BOWL_R - 3, 0.05, Math.PI - 0.05);
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Slightly transparent inner fill
+  ctx.beginPath();
+  ctx.arc(BOWL_CX, BOWL_CY, BOWL_R - 2, 0, Math.PI);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(20,20,35,0.85)';
+  ctx.fill();
+
+  // Opening line (top flat edge)
+  ctx.beginPath();
+  ctx.moveTo(BOWL_CX - BOWL_R, BOWL_CY);
+  ctx.lineTo(BOWL_CX + BOWL_R, BOWL_CY);
+  ctx.strokeStyle = '#4a4a5a';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawParticles() {
+  // Draw water first, then wax (so wax appears on top when floating)
+  for (let pass = 0; pass < 2; pass++) {
+    const targetType = pass === 0 ? T_WATER : T_WAX;
+    const color = targetType === T_WATER ? WATER_COLOR : WAX_COLOR;
+    const glow = targetType === T_WATER ? WATER_GLOW : WAX_GLOW;
+
+    ctx.fillStyle = color;
+    for (const p of particles) {
+      if (p.type !== targetType) continue;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Glow effect for depth
+    ctx.fillStyle = glow;
+    for (const p of particles) {
+      if (p.type !== targetType) continue;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2);
+      ctx.globalAlpha = 0.12;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawMouseIndicator() {
+  if (!mouseDown) return;
+
+  // Stirring ring
+  ctx.beginPath();
+  ctx.arc(mouseX, mouseY, STIR_RADIUS, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Inner dot
+  ctx.beginPath();
+  ctx.arc(mouseX, mouseY, 5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.fill();
+
+  // Motion trail
+  if (mouseDown) {
+    const mvx = mouseX - prevMouseX;
+    const mvy = mouseY - prevMouseY;
+    const speed = Math.sqrt(mvx * mvx + mvy * mvy);
+    if (speed > 1) {
+      ctx.beginPath();
+      ctx.moveTo(prevMouseX, prevMouseY);
+      ctx.lineTo(mouseX, mouseY);
+      ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+  }
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Background gradient
+  const bgGrad = ctx.createRadialGradient(BOWL_CX, BOWL_CY, BOWL_R * 0.5, BOWL_CX, BOWL_CY, W);
+  bgGrad.addColorStop(0, '#1a1a30');
+  bgGrad.addColorStop(1, '#0a0a18');
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  drawBowl();
+  drawParticles();
+  drawMouseIndicator();
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+let accTime = 0;
+let lastTime = 0;
+let frameCount = 0;
+let fpsTime = 0;
+let displayFPS = 0;
+
+function loop(timestamp) {
+  requestAnimationFrame(loop);
+
+  if (lastTime === 0) lastTime = timestamp;
+  let frameTime = (timestamp - lastTime) / 1000;
+  lastTime = timestamp;
+  if (frameTime > 0.05) frameTime = 0.05;
+
+  // FPS counter
+  frameCount++;
+  fpsTime += frameTime;
+  if (fpsTime >= 0.5) {
+    displayFPS = Math.round(frameCount / fpsTime);
+    frameCount = 0;
+    fpsTime = 0;
+    document.getElementById('fps').textContent = displayFPS;
+    document.getElementById('count').textContent = particles.length;
+  }
+
+  // Apply mouse force once per frame (before physics substeps)
+  applyMouseForce();
+
+  // Fixed timestep physics
+  accTime += frameTime;
+  let steps = 0;
+  while (accTime >= DT && steps < MAX_SUBSTEPS) {
+    simulate(DT);
+    accTime -= DT;
+    steps++;
+  }
+
+  render();
+}
+
+// ============================================================
+//  RESET
+// ============================================================
+function reset() {
+  initBoundaries();
+  initParticles();
+  allParticles = particles.concat(boundaries);
+  calibrateRestDensity();
+  accTime = 0;
+  lastTime = 0;
+  frameCount = 0;
+  fpsTime = 0;
+  framePrevMX = mouseX;
+  framePrevMY = mouseY;
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') reset();
+});
+
+// ============================================================
+//  STARTUP
+// ============================================================
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
