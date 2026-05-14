@@ -357,7 +357,7 @@ function buildGrid(arr) {
     const p = arr[i];
     const idx = p._cy * COLS + p._cx;
     if (idx >= 0 && idx < GRID_SIZE) {
-      const pos = gridCounts[idx] + cursors[idx];
+      const pos = cursors[idx];
       gridCells[idx][pos] = p;
       cursors[idx]++;
     }
@@ -375,8 +375,8 @@ function computeDensity(pi, allArr) {
       const nx=cx+dx, ny=cy+dy;
       if (nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
       const cell = gridCells[ny*COLS+nx];
-      const count = gridCounts[ny*COLS+nx];
-      for (let k=0; k<count; k++) {
+      if (!cell) continue;
+      for (let k=0; k<cell.length; k++) {
         const pj = cell[k];
         if (pj === pi) continue;
         const dxij=pi.x-pj.x, dyij=pi.y-pj.y;
@@ -502,9 +502,8 @@ function simulate(dt) {
         if (nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
         const cell = gridCells[ny*COLS+nx];
         if (!cell) continue;
-        const count = gridCounts[ny*COLS+nx];
 
-        for (let k=0; k<count; k++) {
+        for (let k=0; k<cell.length; k++) {
           const pj = cell[k];
           if (pj === pi) continue;
           const dxij=pi.x-pj.x, dyij=pi.y-pj.y;
