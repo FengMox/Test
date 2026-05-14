@@ -93,13 +93,13 @@ const BOWL_CX = W / 2;
 const BOWL_CY = 435;
 const BOWL_R = 215;
 
-const STIR_RADIUS = 80;
-const STIR_STRENGTH = 0.45;
+const STIR_RADIUS = 100;
+const STIR_STRENGTH = 0.7;
 
 // Calibrated after initialization
 let RHO0_WATER, RHO0_WAX;
 let B_WATER = 8000, B_WAX = 2800;
-let ALPHA_WATER = 0.015, ALPHA_WAX = 0.55;
+let ALPHA_WATER = 0.015, ALPHA_WAX = 0.18;
 
 // Cubic spline normalization: σ = 10/(7πh²) in 2D
 const SIGMA = 10 / (7 * Math.PI * H2);
@@ -230,7 +230,7 @@ function calibrateRestDensity() {
     else { sumX += p.rho; cntX++; }
   }
   RHO0_WATER = sumW / cntW;
-  RHO0_WAX = RHO0_WATER * 0.78; // wax is ~78% as dense as water
+  RHO0_WAX = RHO0_WATER * 0.85; // wax is ~85% as dense as water (lighter, floats)
 
   // Calibrate stiffness for ~4% density variation (WCSPH target).
   // From hydrostatic: P ≈ ρ₀·g·H.  From Tait: P ≈ B·γ·Δρ/ρ₀.
